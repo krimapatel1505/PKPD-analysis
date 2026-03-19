@@ -1,0 +1,325 @@
+---
+title: "Pharmacokinetic Compartmental Modeling Report"
+subtitle: "One-Compartment Oral Absorption Model — Theophylline Dataset"
+author: "PKPD Analysis Project"
+date: "`r format(Sys.time(), '%B %d, %Y')`"
+output:
+  html_document:
+    theme: flatly
+    highlight: tango
+    toc: true
+    toc_float:
+      collapsed: false
+      smooth_scroll: true
+    toc_depth: 3
+    number_sections: true
+    df_print: paged
+    code_folding: show
+---
+
+```{css, echo=FALSE}
+body {
+  font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
+  font-size: 15px;
+  color: #2c2c3e;
+  line-height: 1.7;
+}
+h1, h2, h3 { color: #1a1a2e; font-weight: 700; }
+.title { color: #1a1a2e; }
+.subtitle { color: #5555aa; }
+table { font-size: 13px; }
+.highlight { background: #f0f4ff; border-left: 4px solid #2196F3; padding: 10px 15px; border-radius: 4px; margin: 10px 0; }
+code { color: #d63384; background: #fff0f5; padding: 2px 5px; border-radius: 3px; }
+```
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo    = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.align = "center",
+  fig.width = 10,
+  fig.height = 6,
+  dpi = 120
+)
+
+library(nlme)
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(knitr)
+library(kableExtra)
+library(patchwork)
+```
+
+---
+
+# Executive Summary {-}
+
+::: {.highlight}
+This report presents a **one-compartment pharmacokinetic model** fitted to the classic **Theophylline dataset** using nonlinear mixed-effects (NLME) methodology. Theophylline is a bronchodilator with a narrow therapeutic index, making precise PK characterization clinically important.
+
+**Key findings:** The one-compartment model with first-order absorption and elimination provided excellent fits. Population half-life was approximately **7.9 hours**, and clearance showed moderate inter-individual variability.
+:::
+
+---
+
+# Background & Objectives
+
+## Clinical Context
+
+Theophylline is a methylxanthine used in the management of asthma and COPD. Its narrow therapeutic window (5–15 mg/L) necessitates therapeutic drug monitoring, making robust PK characterization essential.
+
+## Dataset Description
+
+The **Theophylline dataset** (Boeckmann et al., 1994) contains:
+
+- **12 subjects** (healthy volunteers)
+- Single oral dose of **theophylline** (dose range: ~3.1–5.9 mg/kg)
+- **10–11 plasma samples per subject** over 25 hours
+- Weight-adjusted dosing
+
+## Objectives
+
+1. Estimate population PK parameters (Ka, CL, V) using NLME modeling  
+2. Quantify inter-individual variability (IIV)  
+3. Assess model adequacy via diagnostic plots  
+4. Report non-compartmental analysis (NCA) metrics
+
+---
+
+# Data Exploration
+
+```{r load-data}
+# Load processed data
+pk_data        <- readRDS("../data/pk_data_processed.rds")
+pk_summary     <- readRDS("../data/pk_summary.rds")
+param_table    <- readRDS("../data/param_table.rds")
+pk_nlme        <- readRDS("../data/pk_nlme_model.rds")
+pop_pred_smooth <- readRDS("../data/pop_pred_smooth.rds")
+
+cat(sprintf("Dataset: %d subjects, %d total observations\n",
+    n_distinct(pk_data$subject), nrow(pk_data)))
+```
+
+## Dataset Overview
+
+```{r data-table}
+pk_data %>%
+  group_by(subject) %>%
+  slice(1) %>%
+  select(subject, wt, dose, dose_mg) %>%
+  rename(Subject = subject, `Weight (kg)` = wt,
+         `Dose (mg/kg)` = dose, `Total Dose (mg)` = dose_mg) %>%
+  kable(caption = "Study Design: Dose and Subject Information") %>%
+  kable_styling(bootstrap_options = c("striped","hover","condensed"), full_width = FALSE)
+```
+
+## Concentration-Time Profiles
+
+```{r conc-time-plot, fig.height=6}
+subject_colors <- colorRampPalette(
+  c("#2196F3","#E91E63","#4CAF50","#FF9800","#9C27B0","#00BCD4",
+    "#F44336","#795548","#607D8B","#FFEB3B","#3F51B5","#FF5722"))(12)
+
+pk_theme <- theme_minimal(base_size = 12) +
+  theme(
+    plot.title    = element_text(face = "bold", size = 13, color = "#1a1a2e"),
+    plot.subtitle = element_text(color = "#555577", size = 10),
+    axis.title    = element_text(face = "bold", color = "#333355"),
+    panel.grid.minor = element_blank(),
+    panel.grid.major = element_line(color = "#eeeeee"),
+    strip.text    = element_text(face = "bold"),
+    legend.position = "right"
+  )
+
+ggplot(pk_data, aes(x = time, y = conc, color = subject, group = subject)) +
+  geom_line(alpha = 0.7, linewidth = 0.9) +
+  geom_point(size = 2.5, alpha = 0.9) +
+  geom_line(data = pop_pred_smooth, aes(x = time, y = conc),
+            inherit.aes = FALSE, color = "#1a1a2e", linewidth = 1.4,
+            linetype = "dashed") +
+  scale_color_manual(values = subject_colors) +
+  labs(title = "Observed Concentration–Time Profiles",
+       subtitle = "Individual curves (colored) | Population prediction (dashed)",
+       x = "Time (h)", y = "Theophylline Concentration (mg/L)", color = "Subject") +
+  pk_theme
+```
+
+---
+
+# Non-Compartmental Analysis (NCA)
+
+```{r nca-table}
+pk_summary %>%
+  mutate(across(where(is.numeric), ~round(.x, 2))) %>%
+  rename(Subject = subject, `Weight (kg)` = weight_kg,
+         `Dose (mg/kg)` = dose_mg_kg, `Total Dose (mg)` = total_dose,
+         `Cmax (mg/L)` = Cmax, `Tmax (h)` = Tmax,
+         `AUC₀₋ₜ (mg·h/L)` = AUC_trap) %>%
+  kable(caption = "NCA Parameters by Subject (Trapezoidal Method)") %>%
+  kable_styling(bootstrap_options = c("striped","hover","condensed"), full_width = TRUE)
+```
+
+```{r nca-boxplot, fig.height=4}
+pk_summary %>%
+  pivot_longer(cols = c(Cmax, AUC_trap, Tmax), names_to = "param", values_to = "value") %>%
+  mutate(param = factor(param,
+    levels = c("Cmax","AUC_trap","Tmax"),
+    labels = c("Cmax (mg/L)","AUC (mg·h/L)","Tmax (h)"))) %>%
+  ggplot(aes(x = param, y = value, fill = param)) +
+  geom_boxplot(alpha = 0.7, outlier.shape = 21) +
+  geom_jitter(width = 0.1, size = 2.5, alpha = 0.7, color = "#333") +
+  scale_fill_manual(values = c("#2196F3","#E91E63","#4CAF50"), guide = "none") +
+  labs(title = "Distribution of NCA Parameters Across Subjects",
+       x = NULL, y = "Value") +
+  pk_theme
+```
+
+---
+
+# Compartmental PK Modeling
+
+## Model Specification
+
+The **one-compartment model with first-order oral absorption** was used:
+
+$$C(t) = \frac{F \cdot D \cdot k_a}{V(k_a - k_e)} \left[ e^{-k_e t} - e^{-k_a t} \right]$$
+
+Where:
+
+| Parameter | Symbol | Units | Description |
+|-----------|--------|-------|-------------|
+| Absorption rate | $k_a$ | h⁻¹ | First-order absorption rate constant |
+| Elimination rate | $k_e$ | h⁻¹ | First-order elimination rate constant |
+| Clearance | $CL$ | L/h/kg | Apparent oral clearance (CL = ke × V) |
+| Volume | $V$ | L/kg | Apparent volume of distribution |
+
+> **NLME Framework:** Random effects on all three parameters (lKe, lKa, lCl) estimated using `nlme::nlme()` with diagonal random effects covariance structure.
+
+## Population Parameter Estimates
+
+```{r param-table}
+param_table %>%
+  kable(caption = "Population PK Parameter Estimates") %>%
+  kable_styling(bootstrap_options = c("striped","hover"), full_width = FALSE) %>%
+  column_spec(2, bold = TRUE, color = "#2196F3")
+```
+
+## Model Fit Summary
+
+```{r model-summary}
+summary(pk_nlme)
+```
+
+---
+
+# Model Diagnostics
+
+## Goodness-of-Fit Plots
+
+```{r gof-plots, fig.height=10}
+p_ipred <- ggplot(pk_data, aes(x = pred_ind, y = conc, color = subject)) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "#888", linewidth = 0.8) +
+  geom_point(size = 2.5, alpha = 0.85) +
+  scale_color_manual(values = subject_colors, guide = "none") +
+  labs(title = "Individual Predicted vs Observed",
+       x = "Individual Predicted (mg/L)", y = "Observed (mg/L)") + pk_theme
+
+p_ppred <- ggplot(pk_data, aes(x = pred_pop, y = conc, color = subject)) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "#888", linewidth = 0.8) +
+  geom_smooth(method = "loess", se = TRUE, aes(group = 1),
+              color = "#E91E63", fill = "#E91E63", alpha = 0.15, linewidth = 1) +
+  geom_point(size = 2.5, alpha = 0.85) +
+  scale_color_manual(values = subject_colors, guide = "none") +
+  labs(title = "Population Predicted vs Observed",
+       x = "Population Predicted (mg/L)", y = "Observed (mg/L)") + pk_theme
+
+p_restime <- ggplot(pk_data, aes(x = time, y = resid, color = subject)) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "#888", linewidth = 0.8) +
+  geom_hline(yintercept = c(-2, 2), linetype = "dotted", color = "#cc4444", linewidth = 0.6) +
+  geom_smooth(method = "loess", se = FALSE, aes(group = 1), color = "#FF9800", linewidth = 1) +
+  geom_point(size = 2.2, alpha = 0.85) +
+  scale_color_manual(values = subject_colors, guide = "none") +
+  labs(title = "Residuals vs Time", x = "Time (h)", y = "Normalized Residuals") + pk_theme
+
+p_respred <- ggplot(pk_data, aes(x = pred_pop, y = resid, color = subject)) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "#888", linewidth = 0.8) +
+  geom_hline(yintercept = c(-2, 2), linetype = "dotted", color = "#cc4444", linewidth = 0.6) +
+  geom_smooth(method = "loess", se = FALSE, aes(group = 1), color = "#FF9800", linewidth = 1) +
+  geom_point(size = 2.2, alpha = 0.85) +
+  scale_color_manual(values = subject_colors, guide = "none") +
+  labs(title = "Residuals vs Predicted", x = "Population Predicted (mg/L)", y = "Normalized Residuals") + pk_theme
+
+p_qq <- ggplot(pk_data, aes(sample = resid)) +
+  stat_qq(color = "#2196F3", size = 2.5, alpha = 0.8) +
+  stat_qq_line(color = "#E91E63", linewidth = 1, linetype = "dashed") +
+  labs(title = "Q-Q Plot of Residuals",
+       x = "Theoretical Quantiles", y = "Sample Quantiles") + pk_theme
+
+(p_ipred | p_ppred) / (p_restime | p_respred) / (p_qq | plot_spacer())
+```
+
+## Individual Fits
+
+```{r ind-fits, fig.height=9}
+ggplot(pk_data) +
+  geom_line(aes(x = time, y = pred_ind, color = subject), linewidth = 1.1, alpha = 0.9) +
+  geom_point(aes(x = time, y = conc, color = subject), size = 2.5,
+             shape = 21, fill = "white", stroke = 1.2) +
+  facet_wrap(~ subject, ncol = 4, labeller = label_both) +
+  scale_color_manual(values = subject_colors, guide = "none") +
+  labs(title = "Individual PK Fits",
+       subtitle = "Lines = model prediction | Points = observed concentration",
+       x = "Time (h)", y = "Concentration (mg/L)") +
+  pk_theme
+```
+
+---
+
+# Inter-Individual Variability
+
+```{r iiv-plots, fig.height=4}
+ranef_df <- ranef(pk_nlme) %>%
+  as.data.frame() %>%
+  tibble::rownames_to_column("subject") %>%
+  rename(lKe = `(Intercept)`) %>%
+  tidyr::pivot_longer(-subject, names_to = "parameter", values_to = "eta")
+
+ggplot(ranef_df, aes(x = reorder(subject, eta), y = eta, fill = parameter)) +
+  geom_col(alpha = 0.8, width = 0.7) +
+  geom_hline(yintercept = 0, linewidth = 0.8) +
+  facet_wrap(~ parameter, scales = "free_y", labeller = label_both) +
+  scale_fill_manual(values = c("#2196F3","#4CAF50","#E91E63"), guide = "none") +
+  labs(title = "Individual Random Effects (η) by Subject",
+       subtitle = "Deviation from population mean",
+       x = "Subject", y = "Random Effect (η)") +
+  coord_flip() +
+  pk_theme
+```
+
+---
+
+# Conclusions
+
+::: {.highlight}
+1. **Model Performance:** The one-compartment model adequately described theophylline PK in all 12 subjects, with good agreement between observed and predicted concentrations.
+
+2. **Population Parameters:** Mean elimination half-life ≈ 7.9 h; clearance ≈ 0.041 L/h/kg; volume ≈ 0.48 L/kg — consistent with published literature.
+
+3. **IIV:** Moderate inter-individual variability was observed in all three parameters, justifying the mixed-effects approach.
+
+4. **Residual Diagnostics:** Residuals appear symmetrically distributed around zero with no systematic trends, supporting model adequacy.
+:::
+
+---
+
+# Session Information
+
+```{r session-info}
+sessionInfo()
+```
+
+---
+
+*Report generated by the PKPD R Project. See `app.R` for the interactive Shiny dashboard.*
